@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Production-grade runtime tuning for low-latency benchmarks.
 #
-#   sudo ./scripts/host-prep.sh [--apply|--dry-run|--revert] [--no-irq] [--no-hugepages]
+#   sudo ./scripts/host-prep.sh [--apply|--dry-run|--revert] \
+#                               [--no-irq] [--no-hugepages] [--keep-smt]
 #
 # What this script does (apply mode):
+#   * Disables SMT / Hyper-Threading (--keep-smt to skip). SMT sibling threads
+#     share L1/L2 and execution resources, which causes irreducible jitter on
+#     the hot path. Done first so later steps only touch the surviving cpus.
 #   * CPU frequency governor -> performance (all online cpus)
 #   * Disables deep C-states (C2+ on Intel, C2+ on AMD acpi_idle)
 #   * Ensures turbo is enabled (Intel intel_pstate / AMD cpufreq boost)
@@ -33,6 +37,7 @@ set -euo pipefail
 ACTION="apply"
 DO_IRQ=1
 DO_HUGEPAGES=1
+DO_SMT_OFF=1
 HUGEPAGES_N="${HUGEPAGES:-128}"   # 128 * 2MiB = 256 MiB
 
 while (( $# )); do
@@ -42,8 +47,9 @@ while (( $# )); do
         --revert)        ACTION="revert" ;;
         --no-irq)        DO_IRQ=0 ;;
         --no-hugepages)  DO_HUGEPAGES=0 ;;
+        --keep-smt|--keep-ht) DO_SMT_OFF=0 ;;
         -h|--help)
-            sed -n '2,30p' "$0"; exit 0 ;;
+            sed -n '2,32p' "$0"; exit 0 ;;
         *)
             echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -81,8 +87,12 @@ write_sysfs() {
         apply)
             [[ -f "$saved" ]] || echo "$current" > "$saved"
             if [[ "$current" != "$value" ]]; then
-                echo "$value" > "$path" 2>/dev/null || echo "  write failed: $path"
-                echo "  set: $path -> $value (was '$current')"
+                if echo "$value" > "$path" 2>/dev/null; then
+                    echo "  set: $path -> $value (was '$current')"
+                else
+                    echo "  write failed: $path (kept '$current')"
+                    rm -f "$saved"   # nothing to revert later
+                fi
             else
                 echo "  already: $path = $value"
             fi
@@ -102,6 +112,23 @@ write_sysfs() {
 }
 
 section() { echo; echo "===== $* ====="; }
+
+if (( DO_SMT_OFF )); then
+    section "SMT / Hyper-Threading: off"
+    # /sys/devices/system/cpu/smt/control accepts: on / off / forceoff.
+    # write_sysfs snapshots the current "on" value before writing "off", and
+    # --revert restores it exactly.
+    if [[ -e /sys/devices/system/cpu/smt/control ]]; then
+        write_sysfs /sys/devices/system/cpu/smt/control "off"
+        # After this, sibling threads are offlined and the cpufreq /
+        # cpuidle directories below only iterate the survivors.
+    else
+        echo "  skip: /sys/devices/system/cpu/smt/control missing (SMT not exposed)"
+    fi
+else
+    echo
+    echo "===== SMT / Hyper-Threading: keep (--keep-smt) ====="
+fi
 
 section "CPU frequency: performance governor"
 for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
@@ -172,32 +199,45 @@ if (( DO_IRQ )); then
     elif ! command -v python3 >/dev/null 2>&1; then
         echo "  python3 not available — skipping IRQ rebind"
     else
-        NCPU=$(nproc)
-        MASK=$(python3 - "$ISOLATED" "$NCPU" <<'PY'
+        # Build the mask from /sys/.../online minus isolated. After SMT off,
+        # online cpus are not contiguous (e.g. 0,2,4,6,...) so we can't rely
+        # on nproc / range here.
+        MASK=$(python3 - "$ISOLATED" <<'PY'
 import sys
-iso_str, ncpu = sys.argv[1], int(sys.argv[2])
-iso = set()
-for part in iso_str.split(','):
-    part = part.strip()
-    if not part: continue
-    if '-' in part:
-        a,b = part.split('-')
-        iso.update(range(int(a), int(b)+1))
-    else:
-        iso.add(int(part))
+
+def expand(s):
+    out = set()
+    if not s:
+        return out
+    for part in s.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            a, b = part.split('-')
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+with open('/sys/devices/system/cpu/online') as f:
+    online_str = f.read().strip()
+online = expand(online_str)
+iso = expand(sys.argv[1])
+allowed = online - iso
+
+# smp_affinity bit position for cpu N is bit N — gaps must be preserved.
 m = 0
-for c in range(ncpu):
-    if c not in iso:
-        m |= 1 << c
-# smp_affinity wants a comma-grouped hex bitmask, 32 bits per group, LSB group first... actually
-# smp_affinity is one long hex value with optional commas every 32 bits. A single hex w/o commas
-# is accepted by the kernel for cpus < 32; for >32 we need grouping.
-hex_full = format(m, 'x')
-# Pad to multiple of 8 hex chars (32 bits) and insert commas every 8 chars from the right.
+for c in allowed:
+    m |= 1 << c
+
+# smp_affinity is a comma-grouped hex bitmask (groups of 32 bits, MSB group
+# first). A single hex without commas is accepted for cpu count < 32; for
+# bigger systems we pad and group.
+hex_full = format(m, 'x') or '0'
 pad = (-len(hex_full)) % 8
 hex_full = '0' * pad + hex_full
-out = ','.join(hex_full[i:i+8] for i in range(0, len(hex_full), 8))
-print(out)
+print(','.join(hex_full[i:i+8] for i in range(0, len(hex_full), 8)))
 PY
 )
         echo "  non-isolated mask: $MASK"
@@ -225,6 +265,8 @@ echo "    skew_tick=1 clocksource=tsc tsc=reliable"
 echo
 
 section "Sanity"
+echo "  smt control:       $(cat /sys/devices/system/cpu/smt/control 2>/dev/null || echo '?')  (active=$(cat /sys/devices/system/cpu/smt/active 2>/dev/null || echo '?'))"
+echo "  online cpus:       $(cat /sys/devices/system/cpu/online)"
 echo "  governor (cpu0):   $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?')"
 echo "  turbo state:       $(
     if [[ -e /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then

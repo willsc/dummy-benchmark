@@ -32,8 +32,20 @@ NCPU=$(nproc)
 ONLINE=$(read_or_empty /sys/devices/system/cpu/online)
 ISOLATED=$(read_or_empty /sys/devices/system/cpu/isolated)
 GOVERNOR=$(read_or_empty /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
-SMT=$(read_or_empty /sys/devices/system/cpu/smt/active)
+SMT_ACTIVE=$(read_or_empty /sys/devices/system/cpu/smt/active)
+SMT_CONTROL=$(read_or_empty /sys/devices/system/cpu/smt/control)
 CMDLINE=$(read_or_empty /proc/cmdline)
+
+# Build a {core_id -> "tid_list"} mapping by walking each online cpu's
+# topology directory. Pinning a thread on cpu N and another on its sibling is
+# almost always wrong — they share L1/L2.
+declare -A SIBLINGS
+for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
+    [[ -d "$cpu" ]] || continue
+    [[ -r "$cpu/topology/thread_siblings_list" ]] || continue
+    sib=$(cat "$cpu/topology/thread_siblings_list")
+    SIBLINGS["$sib"]=1
+done
 
 # resctrl capability.
 RESCTRL_AVAIL=0
@@ -98,21 +110,22 @@ fi
 
 if [[ "$MODE" == "json" ]]; then
     python3 - "$VENDOR" "$MODEL" "$MICROCODE" "$KERNEL" "$ONLINE" "$ISOLATED" \
-             "$GOVERNOR" "$SMT" "$RESCTRL_AVAIL" "$RESCTRL_MOUNTED" \
+             "$GOVERNOR" "$SMT_ACTIVE" "$SMT_CONTROL" \
+             "$RESCTRL_AVAIL" "$RESCTRL_MOUNTED" \
              "$L3_NUM_CLOSIDS" "$L3_CBM_MASK" "$L3_MIN_CBM" \
              "$SUGG_ISO" "$SUGG_SHARED" "$SUGG_NOTE" "$CMDLINE" \
              <<'PY' "${!L3_GROUPS[@]}"
-import json, sys
-keys = sys.argv[1:18]
-ll3 = sys.argv[18:]
+import json, sys, os
+keys = sys.argv[1:19]
+ll3 = sys.argv[19:]
 labels = ["vendor","model","microcode","kernel","online","isolated","governor",
-          "smt_active","resctrl_available","resctrl_mounted","l3_num_closids",
+          "smt_active","smt_control",
+          "resctrl_available","resctrl_mounted","l3_num_closids",
           "l3_cbm_mask","l3_min_cbm_bits","suggested_iso","suggested_shared",
           "note","cmdline"]
 d = dict(zip(labels, keys))
 d["l3_instances"] = ll3
-# Read numa too.
-import os
+# NUMA
 numa = {}
 nroot = "/sys/devices/system/node"
 if os.path.isdir(nroot):
@@ -122,6 +135,21 @@ if os.path.isdir(nroot):
             if os.path.exists(p):
                 numa[n] = open(p).read().strip()
 d["numa_nodes"] = numa
+# Thread siblings
+siblings = []
+seen = set()
+croot = "/sys/devices/system/cpu"
+if os.path.isdir(croot):
+    for entry in sorted(os.listdir(croot)):
+        if not entry.startswith("cpu") or not entry[3:].isdigit():
+            continue
+        p = os.path.join(croot, entry, "topology/thread_siblings_list")
+        if os.path.exists(p):
+            s = open(p).read().strip()
+            if s not in seen:
+                seen.add(s)
+                siblings.append(s)
+d["thread_siblings"] = siblings
 print(json.dumps(d, indent=2))
 PY
     exit 0
@@ -136,7 +164,13 @@ echo "microcode:   $MICROCODE"
 echo "online:      $ONLINE  (nproc=$NCPU)"
 echo "isolated:    ${ISOLATED:-<none>}"
 echo "governor:    $GOVERNOR (cpu0)"
-echo "smt_active:  ${SMT:-?}"
+echo "smt:         control=${SMT_CONTROL:-?} active=${SMT_ACTIVE:-?}"
+if [[ "$SMT_ACTIVE" == "1" ]]; then
+    echo "             -> recommend: sudo ./scripts/host-prep.sh --apply (will disable SMT)"
+fi
+echo
+echo "Thread siblings (each line is one physical core):"
+echo "${!SIBLINGS[@]}" | tr ' ' '\n' | sort -V -u | sed 's/^/  /'
 echo
 
 echo "NUMA nodes:"

@@ -193,6 +193,10 @@ sudo ./scripts/host-prep.sh --revert      # restore prior values
 
 Applies:
 
+- **Disables SMT / Hyper-Threading** via `/sys/devices/system/cpu/smt/control`
+  (`--keep-smt` to opt out). SMT siblings share L1/L2 and execution
+  resources, which causes irreducible jitter on the hot path. Done first so
+  the rest of the script only touches surviving CPUs.
 - `performance` cpufreq governor on every online CPU
 - Disables every C-state below `C1` (deep states cause µs-scale wake jitter)
 - Enables turbo / boost (Intel `intel_pstate`, AMD `cpufreq/boost`)
@@ -201,7 +205,9 @@ Applies:
 - Disables the NMI watchdog
 - Bumps scheduler granularity so threads stay on their pinned core
 - Bumps `net.core.{r,w}mem_max` to 64 MiB for UDP
-- Rebinds every IRQ off the isolated cores (`--no-irq` to skip)
+- Rebinds every IRQ off the isolated cores (`--no-irq` to skip). The mask is
+  built from `/sys/devices/system/cpu/online` minus `isolated`, so the
+  non-contiguous online layout left after SMT-off is handled correctly.
 
 Every individual sysfs/procfs write is snapshotted under
 `/var/run/dummy-benchmark/` so `--revert` restores prior values exactly.
