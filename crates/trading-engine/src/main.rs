@@ -27,8 +27,8 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use serde::Serialize;
 
 use shmbus::{
-    cpu, host_info, noise, write_report, HostInfo, LatencyHistogram, LatencySummary, MarketTick,
-    OrderMsg, Side, ShmBus, SLOT_PAYLOAD,
+    cpu, host_info, noise, resctrl, write_report, HostInfo, LatencyHistogram, LatencySummary,
+    MarketTick, OrderMsg, Side, ShmBus, SLOT_PAYLOAD,
 };
 
 #[derive(Parser, Debug)]
@@ -65,6 +65,12 @@ struct Args {
     /// CPU list for noise threads (e.g. "0-3,12").
     #[arg(long, default_value = "")]
     noise_cpus: String,
+    /// resctrl group for main + worker threads (hot path).
+    #[arg(long, default_value = "")]
+    resctrl_group: String,
+    /// resctrl group for noise threads.
+    #[arg(long, default_value = "")]
+    noise_resctrl_group: String,
     /// Run for N seconds then exit (0 = run until ctrl-c).
     #[arg(long, default_value_t = 0)]
     bench_secs: u64,
@@ -92,6 +98,10 @@ struct EngineConfig {
     worker_cpus: String,
     noise_threads: usize,
     noise_cpus: String,
+    resctrl_group: String,
+    noise_resctrl_group: String,
+    resctrl_available: bool,
+    schemata: String,
     bench_secs: u64,
     ema_halflife: f64,
     threshold_bps: f64,
@@ -144,6 +154,15 @@ fn main() -> Result<()> {
         cpu::pin_to_cpu(c).with_context(|| format!("pinning main to cpu {c}"))?;
         eprintln!("trading-engine: pinned main thread to cpu {c}");
     }
+    if !args.resctrl_group.is_empty() {
+        resctrl::join_group(&args.resctrl_group, false)
+            .with_context(|| format!("joining resctrl group {}", args.resctrl_group))?;
+        eprintln!(
+            "trading-engine: joined resctrl group {} (schemata: {})",
+            args.resctrl_group,
+            resctrl::current_schemata(&args.resctrl_group).unwrap_or_default()
+        );
+    }
 
     let host = host_info();
     eprintln!(
@@ -158,11 +177,20 @@ fn main() -> Result<()> {
 
     let noise_handle = if args.noise_threads > 0 {
         eprintln!(
-            "trading-engine: spawning {} noise threads on [{}]",
+            "trading-engine: spawning {} noise threads on [{}] (resctrl={})",
             args.noise_threads,
-            cpu::format_cpu_list(&noise_cpus)
+            cpu::format_cpu_list(&noise_cpus),
+            if args.noise_resctrl_group.is_empty() {
+                "<none>"
+            } else {
+                &args.noise_resctrl_group
+            }
         );
-        Some(noise::spawn_noise(args.noise_threads, &noise_cpus))
+        Some(noise::spawn_noise(
+            args.noise_threads,
+            &noise_cpus,
+            &args.noise_resctrl_group,
+        ))
     } else {
         None
     };
@@ -309,9 +337,10 @@ fn run_with_workers(
         let threshold_bps = args.threshold_bps;
         let qty = args.qty;
         let stop_w = stop.clone();
+        let group = args.resctrl_group.clone();
         let h = thread::Builder::new()
             .name(format!("strategy-{w}"))
-            .spawn(move || worker_main(w, rx, order_tx_w, pin, stop_w, alpha,
+            .spawn(move || worker_main(w, rx, order_tx_w, pin, &group, stop_w, alpha,
                                        threshold_bps, cooldown_ns, qty))
             .context("spawning worker thread")?;
         handles.push(h);
@@ -423,6 +452,7 @@ fn worker_main(
     rx: Receiver<WorkItem>,
     order_tx: Sender<(OrderMsg, &'static str)>,
     pin_cpu: Option<usize>,
+    resctrl_group: &str,
     stop: Arc<AtomicBool>,
     alpha: f64,
     threshold_bps: f64,
@@ -434,6 +464,11 @@ fn worker_main(
             eprintln!("worker-{id}: failed to pin cpu {c}: {e}");
         } else {
             eprintln!("worker-{id}: pinned to cpu {c}");
+        }
+    }
+    if !resctrl_group.is_empty() {
+        if let Err(e) = resctrl::join_group(resctrl_group, true) {
+            eprintln!("worker-{id}: resctrl join failed: {e}");
         }
     }
     let mut state: HashMap<[u8; shmbus::message::SYMBOL_LEN], SymbolState> = HashMap::new();
@@ -582,6 +617,14 @@ fn finalise_report(
             worker_cpus: args.worker_cpus.clone(),
             noise_threads: args.noise_threads,
             noise_cpus: cpu::format_cpu_list(&noise_cpus),
+            resctrl_group: args.resctrl_group.clone(),
+            noise_resctrl_group: args.noise_resctrl_group.clone(),
+            resctrl_available: resctrl::is_available(),
+            schemata: if args.resctrl_group.is_empty() {
+                String::new()
+            } else {
+                resctrl::current_schemata(&args.resctrl_group).unwrap_or_default()
+            },
             bench_secs: args.bench_secs,
             ema_halflife: args.ema_halflife,
             threshold_bps: args.threshold_bps,

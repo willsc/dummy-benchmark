@@ -21,8 +21,8 @@ use io_uring::{opcode, types, IoUring};
 use serde::Serialize;
 
 use shmbus::{
-    cpu, host_info, noise, write_report, HostInfo, LatencyHistogram, LatencySummary, MarketTick,
-    OrderMsg, ShmBus, SLOT_PAYLOAD,
+    cpu, host_info, noise, resctrl, write_report, HostInfo, LatencyHistogram, LatencySummary,
+    MarketTick, OrderMsg, ShmBus, SLOT_PAYLOAD,
 };
 
 /// Number of in-flight `recv` SQEs we keep posted at all times.
@@ -52,6 +52,12 @@ struct Args {
     /// CPU list to round-robin pin noise threads to (e.g. "0-3,8").
     #[arg(long, default_value = "")]
     noise_cpus: String,
+    /// resctrl group to join (main thread). Provision via scripts/cache-alloc.sh.
+    #[arg(long, default_value = "")]
+    resctrl_group: String,
+    /// resctrl group for noise threads (typically a more restrictive CBM).
+    #[arg(long, default_value = "")]
+    noise_resctrl_group: String,
     /// Run for N seconds then exit (0 = run until ctrl-c).
     #[arg(long, default_value_t = 0)]
     bench_secs: u64,
@@ -77,6 +83,10 @@ struct FeedhandlerConfig {
     pin_cpu: Option<usize>,
     noise_threads: usize,
     noise_cpus: String,
+    resctrl_group: String,
+    noise_resctrl_group: String,
+    resctrl_available: bool,
+    schemata: String,
     bench_secs: u64,
     bind: String,
     bus: String,
@@ -109,6 +119,15 @@ fn main() -> Result<()> {
         cpu::pin_to_cpu(c).with_context(|| format!("pinning main to cpu {c}"))?;
         eprintln!("feedhandler: pinned main thread to cpu {c}");
     }
+    if !args.resctrl_group.is_empty() {
+        resctrl::join_group(&args.resctrl_group, false)
+            .with_context(|| format!("joining resctrl group {}", args.resctrl_group))?;
+        eprintln!(
+            "feedhandler: joined resctrl group {} (schemata: {})",
+            args.resctrl_group,
+            resctrl::current_schemata(&args.resctrl_group).unwrap_or_default()
+        );
+    }
 
     let host = host_info();
     eprintln!(
@@ -120,11 +139,20 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow!("--noise-cpus: {e}"))?;
     let noise_handle = if args.noise_threads > 0 {
         eprintln!(
-            "feedhandler: spawning {} noise threads on [{}]",
+            "feedhandler: spawning {} noise threads on [{}] (resctrl={})",
             args.noise_threads,
-            cpu::format_cpu_list(&noise_cpus)
+            cpu::format_cpu_list(&noise_cpus),
+            if args.noise_resctrl_group.is_empty() {
+                "<none>"
+            } else {
+                &args.noise_resctrl_group
+            }
         );
-        Some(noise::spawn_noise(args.noise_threads, &noise_cpus))
+        Some(noise::spawn_noise(
+            args.noise_threads,
+            &noise_cpus,
+            &args.noise_resctrl_group,
+        ))
     } else {
         None
     };
@@ -268,6 +296,14 @@ fn main() -> Result<()> {
             pin_cpu: args.pin_cpu,
             noise_threads: args.noise_threads,
             noise_cpus: cpu::format_cpu_list(&noise_cpus),
+            resctrl_group: args.resctrl_group.clone(),
+            noise_resctrl_group: args.noise_resctrl_group.clone(),
+            resctrl_available: resctrl::is_available(),
+            schemata: if args.resctrl_group.is_empty() {
+                String::new()
+            } else {
+                resctrl::current_schemata(&args.resctrl_group).unwrap_or_default()
+            },
             bench_secs: args.bench_secs,
             bind: args.bind.to_string(),
             bus: args.bus.clone(),

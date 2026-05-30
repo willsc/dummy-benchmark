@@ -18,9 +18,16 @@
 #   OUT=bench-out  directory under repo root where reports are written
 #   ISO_CPUS=...   explicit isolated-CPU list; defaults to /sys isolated
 #   SHARED_CPUS=.. explicit shared-CPU list; defaults to "online minus isolated"
+#   PROD=1         run host-prep + cache-alloc before the scenarios. Requires
+#                  sudo; restores prior tuning at the end via host-prep --revert.
+#                  Also passes --resctrl-group hot / --noise-resctrl-group noise
+#                  to all binaries.
+#   HOT_GROUP=hot       resctrl group for hot path (used when PROD=1)
+#   NOISE_GROUP=noise   resctrl group for noise threads (used when PROD=1)
 #
 # Example:
 #   ISO_CPUS=4-7 SHARED_CPUS=0-3 WORKERS=2 NOISE=4 SECS=20 scripts/run-bench.sh
+#   sudo PROD=1 ISO_CPUS=4-11 WORKERS=4 SECS=60 scripts/run-bench.sh
 
 set -euo pipefail
 
@@ -30,9 +37,39 @@ SYMBOLS="${SYMBOLS:-AAPL,MSFT,GOOG,NVDA,AMZN,META,TSLA,AMD}"
 WORKERS="${WORKERS:-2}"
 NOISE="${NOISE:-4}"
 OUT="${OUT:-bench-out}"
+PROD="${PROD:-0}"
+HOT_GROUP="${HOT_GROUP:-hot}"
+NOISE_GROUP="${NOISE_GROUP:-noise}"
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+# Production prep: host-prep --apply + cache-alloc --setup.
+PROD_PREPPED=0
+prod_setup() {
+    if (( PROD != 1 )); then return; fi
+    if [[ $EUID -ne 0 ]]; then
+        echo "[bench] PROD=1 needs root for host-prep + cache-alloc; re-run with sudo." >&2
+        exit 1
+    fi
+    echo "[bench] PROD=1: running host-prep --apply"
+    "$ROOT/scripts/host-prep.sh" --apply >/dev/null
+    echo "[bench] PROD=1: running cache-alloc.sh (HOT=$HOT_GROUP NOISE=$NOISE_GROUP)"
+    HOT_GROUP="$HOT_GROUP" NOISE_GROUP="$NOISE_GROUP" \
+        "$ROOT/scripts/cache-alloc.sh" --setup >/dev/null || {
+            echo "[bench] cache-alloc setup failed — continuing without CAT." >&2
+        }
+    PROD_PREPPED=1
+}
+prod_teardown() {
+    if (( PROD_PREPPED != 1 )); then return; fi
+    echo "[bench] PROD=1: tearing down — host-prep --revert + cache-alloc --clean"
+    HOT_GROUP="$HOT_GROUP" NOISE_GROUP="$NOISE_GROUP" \
+        "$ROOT/scripts/cache-alloc.sh" --clean >/dev/null || true
+    "$ROOT/scripts/host-prep.sh" --revert >/dev/null || true
+}
+trap prod_teardown EXIT INT TERM
+prod_setup
 
 read_cpu_file() {
     local path="$1"
@@ -193,12 +230,24 @@ run_scenario() {
     if (( noise_n > 0 )); then
         eng_extra="--noise-threads $noise_n --noise-cpus $SHARED_CPUS"
     fi
+    # When PROD=1 has provisioned resctrl groups, route hot threads into HOT
+    # and noise threads into NOISE.
+    if (( PROD_PREPPED == 1 )) && [[ -d "/sys/fs/resctrl/$HOT_GROUP" ]]; then
+        fh_extra+=" --resctrl-group $HOT_GROUP"
+        eng_extra+=" --resctrl-group $HOT_GROUP"
+        me_extra+=" --resctrl-group $HOT_GROUP"
+        if (( noise_n > 0 )) && [[ -d "/sys/fs/resctrl/$NOISE_GROUP" ]]; then
+            eng_extra+=" --noise-resctrl-group $NOISE_GROUP"
+        fi
+    fi
 
+    # shellcheck disable=SC2086
     "$FH" --bind "$BIND" --bus "$bus" \
         --pin-cpu "$fh_cpu" \
         --bench-secs "$SECS" \
         --bench-report "$outdir/feedhandler.json" \
         --quiet \
+        $fh_extra \
         >"$outdir/feedhandler.log" 2>&1 &
     local FH_PID=$!
 
@@ -217,9 +266,11 @@ run_scenario() {
 
     sleep 0.2
 
+    # shellcheck disable=SC2086
     "$ME" --target "$BIND" --rate "$RATE" --symbols "$SYMBOLS" \
         --pin-cpu "$me_cpu" \
         --bench-secs "$SECS" \
+        $me_extra \
         >"$outdir/mock-exchange.log" 2>&1 &
     local ME_PID=$!
 

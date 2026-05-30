@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use crate::cpu;
+use crate::{cpu, resctrl};
 
 pub struct NoiseHandle {
     threads: Vec<JoinHandle<()>>,
@@ -23,12 +23,17 @@ impl NoiseHandle {
 }
 
 /// Spawn `n_threads` noise workers, round-robin pinned to `pin_cpus`.
-pub fn spawn_noise(n_threads: usize, pin_cpus: &[usize]) -> NoiseHandle {
+/// If `resctrl_group` is non-empty, each thread also joins that resctrl
+/// group right after pinning (so its accesses get the noise CBM, not the
+/// hot-path one).
+pub fn spawn_noise(n_threads: usize, pin_cpus: &[usize], resctrl_group: &str) -> NoiseHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let pinned: Vec<usize> = pin_cpus.to_vec();
+    let group = resctrl_group.to_string();
     let mut threads = Vec::with_capacity(n_threads);
     for i in 0..n_threads {
         let stop_c = stop.clone();
+        let group_c = group.clone();
         let pin = if pinned.is_empty() {
             None
         } else {
@@ -36,17 +41,22 @@ pub fn spawn_noise(n_threads: usize, pin_cpus: &[usize]) -> NoiseHandle {
         };
         let h = thread::Builder::new()
             .name(format!("noise-{i}"))
-            .spawn(move || noise_worker(stop_c, pin))
+            .spawn(move || noise_worker(stop_c, pin, &group_c))
             .expect("failed to spawn noise thread");
         threads.push(h);
     }
     NoiseHandle { threads, stop }
 }
 
-fn noise_worker(stop: Arc<AtomicBool>, pin_cpu: Option<usize>) {
+fn noise_worker(stop: Arc<AtomicBool>, pin_cpu: Option<usize>, resctrl_group: &str) {
     if let Some(c) = pin_cpu {
         if let Err(e) = cpu::pin_to_cpu(c) {
             eprintln!("noise: failed to pin to cpu {c}: {e}");
+        }
+    }
+    if !resctrl_group.is_empty() {
+        if let Err(e) = resctrl::join_group(resctrl_group, true) {
+            eprintln!("noise: failed to join resctrl group {resctrl_group}: {e}");
         }
     }
     // A 1 MiB scratch keeps an L2-sized working set hot — this is what causes

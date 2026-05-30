@@ -14,7 +14,7 @@ use clap::Parser;
 use rand::Rng;
 
 use shmbus::message::SYMBOL_LEN;
-use shmbus::{cpu, noise, MarketTick};
+use shmbus::{cpu, noise, resctrl, MarketTick};
 
 #[derive(Parser, Debug)]
 #[command(about = "Synthetic market data publisher (UDP)")]
@@ -40,6 +40,12 @@ struct Args {
     /// CPU list for noise threads (e.g. "0-3,8").
     #[arg(long, default_value = "")]
     noise_cpus: String,
+    /// resctrl group to join (main thread).
+    #[arg(long, default_value = "")]
+    resctrl_group: String,
+    /// resctrl group for noise threads.
+    #[arg(long, default_value = "")]
+    noise_resctrl_group: String,
     /// Run for N seconds then exit (0 = run until count or ctrl-c).
     #[arg(long, default_value_t = 0)]
     bench_secs: u64,
@@ -73,6 +79,11 @@ fn main() -> Result<()> {
         cpu::pin_to_cpu(c).with_context(|| format!("pinning main to cpu {c}"))?;
         eprintln!("mock-exchange: pinned main thread to cpu {c}");
     }
+    if !args.resctrl_group.is_empty() {
+        resctrl::join_group(&args.resctrl_group, false)
+            .with_context(|| format!("joining resctrl group {}", args.resctrl_group))?;
+        eprintln!("mock-exchange: joined resctrl group {}", args.resctrl_group);
+    }
 
     let noise_cpus = cpu::parse_cpu_list(&args.noise_cpus)
         .map_err(|e| anyhow!("--noise-cpus: {e}"))?;
@@ -82,7 +93,11 @@ fn main() -> Result<()> {
             args.noise_threads,
             cpu::format_cpu_list(&noise_cpus)
         );
-        Some(noise::spawn_noise(args.noise_threads, &noise_cpus))
+        Some(noise::spawn_noise(
+            args.noise_threads,
+            &noise_cpus,
+            &args.noise_resctrl_group,
+        ))
     } else {
         None
     };

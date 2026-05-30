@@ -139,6 +139,125 @@ scenario  wire p50  wire p99 wire p999   shm p50   shm p99   e2e p50   e2e p99 e
    noisy   20.00us   50.00us    1.00ms   50.00us    1.00ms   50.00us    1.00ms    5.00ms    18.02K       87     3.60K
 ```
 
+## Production runbook (kernel tuning + cache allocation)
+
+For results that actually reflect the hardware — instead of noise from
+governor switching, IRQ thrash, deep C-states, transparent huge pages,
+or L3 eviction by background load — apply the host tuning *and* allocate
+cache ways before benchmarking.
+
+### 0. Kernel cmdline (boot-time, not runtime)
+
+These have to be in the GRUB / systemd-boot kernel cmdline. Reboot required.
+
+```
+isolcpus=managed_irq,domain,<core-list>
+nohz_full=<core-list>
+rcu_nocbs=<core-list>
+intel_pstate=passive          # Intel
+amd_pstate=active             # AMD recent kernels
+default_hugepagesz=2M hugepages=128
+mitigations=off               # only on dedicated benchmark hosts
+skew_tick=1 clocksource=tsc tsc=reliable
+```
+
+Pick `<core-list>` to match the cores you'll pin the hot path to.
+A typical 1S Xeon 16-core layout: isolate `4-15`, leave `0-3` for the kernel
+and `mock-exchange`. On a 2-CCD AMD Epyc, isolate one CCD entirely.
+
+After reboot, verify:
+
+```
+cat /sys/devices/system/cpu/isolated
+cat /proc/cmdline
+```
+
+### 1. Topology inspection
+
+```
+./scripts/topology.sh
+```
+
+Prints vendor/model, NUMA, AMD CCDs (each unique L3 `shared_cpu_list`), cache
+sizes, resctrl capability, and a recommended `ISO_CPUS` / `SHARED_CPUS`.
+
+`./scripts/topology.sh --json` for the machine-readable form.
+
+### 2. Runtime kernel tuning
+
+```
+sudo ./scripts/host-prep.sh --dry-run     # preview every write
+sudo ./scripts/host-prep.sh --apply       # apply
+sudo ./scripts/host-prep.sh --revert      # restore prior values
+```
+
+Applies:
+
+- `performance` cpufreq governor on every online CPU
+- Disables every C-state below `C1` (deep states cause µs-scale wake jitter)
+- Enables turbo / boost (Intel `intel_pstate`, AMD `cpufreq/boost`)
+- THP `enabled=madvise`, `defrag=never`, swappiness=0, zone_reclaim_mode=0
+- `nr_hugepages=128` (256 MiB of 2MB pages — override with `HUGEPAGES=…`)
+- Disables the NMI watchdog
+- Bumps scheduler granularity so threads stay on their pinned core
+- Bumps `net.core.{r,w}mem_max` to 64 MiB for UDP
+- Rebinds every IRQ off the isolated cores (`--no-irq` to skip)
+
+Every individual sysfs/procfs write is snapshotted under
+`/var/run/dummy-benchmark/` so `--revert` restores prior values exactly.
+Re-running `--apply` is idempotent.
+
+### 3. Cache allocation (Intel CAT / AMD CAT)
+
+Provisions two `resctrl` groups: `hot` (top L3 ways, full memory BW) and
+`noise` (bottom L3 ways, capped memory BW on Intel).
+
+```
+sudo ./scripts/cache-alloc.sh --setup     # create groups + schemata
+./scripts/cache-alloc.sh --show           # inspect
+sudo ./scripts/cache-alloc.sh --clean     # tear down
+```
+
+Tunable via env vars:
+- `HOT_WAYS_PCT=75` — % of L3 ways for hot path (rest goes to noise)
+- `NOISE_MB_PCT=30` — Intel MBA cap for the noise group
+- `OWNER=$(id -un)` — who's running the bench (`tasks` files get `chown`ed
+  so non-root processes can join)
+
+On AMD Epyc the same per-cache-id CBM is applied to every L3 instance, which
+combines naturally with single-CCD pinning to give exclusive L3 to the hot
+path.
+
+### 4. Bench
+
+The Rust binaries each take `--resctrl-group NAME` and the engine also takes
+`--noise-resctrl-group NAME`. Threads call `join_group(name)` from
+`shmbus::resctrl` right after pinning, so the kernel applies the right CBM
+from the first memory touch.
+
+The easiest path: `PROD=1` runs steps 2–4 automatically and reverts on exit.
+
+```
+sudo PROD=1 ISO_CPUS=4-11 WORKERS=4 NOISE=6 SECS=60 ./scripts/run-bench.sh
+```
+
+This runs `host-prep --apply`, `cache-alloc --setup`, the two scenarios with
+`--resctrl-group hot` / `--noise-resctrl-group noise`, then `cache-alloc
+--clean` and `host-prep --revert` on exit.
+
+### Cross-vendor comparison workflow
+
+```
+# On each machine (Xeon, Epyc):
+sudo PROD=1 ISO_CPUS=4-11 WORKERS=4 NOISE=6 SECS=60 ./scripts/run-bench.sh
+scp bench-out/iso/engine.json     user@plotbox:results/$(hostname)-iso-engine.json
+scp bench-out/noisy/engine.json   user@plotbox:results/$(hostname)-noisy-engine.json
+```
+
+Every JSON report carries a full `host` block (vendor, model, microcode,
+governor, turbo state, NUMA nodes, cache sizes) so the source machine is
+unambiguous when diffing across boxes.
+
 ## Running components by hand
 
 ```

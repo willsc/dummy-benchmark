@@ -16,6 +16,7 @@ pub mod latency;
 pub mod message;
 pub mod noise;
 pub mod report;
+pub mod resctrl;
 pub mod ring;
 pub mod shm;
 
