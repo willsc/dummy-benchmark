@@ -1,0 +1,18 @@
+[package]
+name = "trading-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "trading-engine"
+path = "src/main.rs"
+
+[dependencies]
+shmbus.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+ctrlc.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true

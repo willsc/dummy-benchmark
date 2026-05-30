@@ -1,0 +1,16 @@
+[package]
+name = "mock-exchange"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mock-exchange"
+path = "src/main.rs"
+
+[dependencies]
+shmbus.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+ctrlc.workspace = true
